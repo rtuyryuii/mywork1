@@ -1,4 +1,4 @@
-name: Test In-Memory OCR Without Disk Landing
+name: Test In-Memory OCR V2
 
 on:
   workflow_dispatch:
