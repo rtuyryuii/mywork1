@@ -25,6 +25,25 @@ jobs:
               $logLine | Out-File -FilePath $logFile -Append -Encoding utf8
           }
 
+          # 自定义通用 WinRT 异步等待函数（不依赖扩展方法）
+          function Await-WinRT ($asyncOp) {
+              $asTaskMethod = [System.WindowsRuntimeSystemExtensions].GetMethods() | 
+                  Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 } | 
+                  Select-Object -First 1
+              
+              if ($asyncOp.GetType().IsGenericType) {
+                  $genericMethod = $asTaskMethod.MakeGenericMethod($asyncOp.GetType().GetGenericArguments())
+                  $task = $genericMethod.Invoke($null, @($asyncOp))
+              } else {
+                  $task = $asTaskMethod.Invoke($null, @($asyncOp))
+              }
+              $task.Wait()
+              if ($task.Exception) { throw $task.Exception }
+              if ($task.GetType().GetProperty('Result')) {
+                  return $task.Result
+              }
+          }
+
           try {
               Write-TestLog "Launching Microsoft Edge..."
               Start-Process "msedge.exe" -ArgumentList "https://account.microsoft.com/account", "--start-maximized"
@@ -35,6 +54,7 @@ jobs:
               Write-TestLog "Capturing screen directly into System.IO.MemoryStream..."
               Add-Type -AssemblyName System.Drawing
               Add-Type -AssemblyName System.Windows.Forms
+              Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
               $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
               $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
@@ -61,21 +81,21 @@ jobs:
               $writer = New-Object Windows.Storage.Streams.DataWriter($randomAccessStream)
               $writer.WriteBytes($bytes)
               
-              $storeTask = $writer.StoreAsync().AsTask()
-              $storeTask.Wait()
+              # 安全等待 StoreAsync 完成
+              $storeAsync = $writer.StoreAsync()
+              $null = Await-WinRT $storeAsync
+              
               $writer.DetachStream()
               $writer.Dispose()
 
               $randomAccessStream.Seek(0)
 
               Write-TestLog "Initializing BitmapDecoder and OcrEngine..."
-              $decoderTask = [Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($randomAccessStream).AsTask()
-              $decoderTask.Wait()
-              $decoder = $decoderTask.Result
+              $decoderAsync = [Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($randomAccessStream)
+              $decoder = Await-WinRT $decoderAsync
 
-              $softwareBitmapTask = $decoder.GetSoftwareBitmapAsync().AsTask()
-              $softwareBitmapTask.Wait()
-              $softwareBitmap = $softwareBitmapTask.Result
+              $softwareBitmapAsync = $decoder.GetSoftwareBitmapAsync()
+              $softwareBitmap = Await-WinRT $softwareBitmapAsync
 
               $language = New-Object Windows.Globalization.Language("en-US")
               $ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
@@ -85,9 +105,8 @@ jobs:
               }
 
               Write-TestLog "Executing OCR Engine recognizer..."
-              $ocrTask = $ocrEngine.RecognizeAsync($softwareBitmap).AsTask()
-              $ocrTask.Wait()
-              $ocrResult = $ocrTask.Result
+              $ocrAsync = $ocrEngine.RecognizeAsync($softwareBitmap)
+              $ocrResult = Await-WinRT $ocrAsync
 
               Write-TestLog "----------------- OCR RECOGNIZED TEXT -----------------"
               if ($ocrResult.Text) {
