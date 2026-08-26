@@ -25,23 +25,25 @@ jobs:
               $logLine | Out-File -FilePath $logFile -Append -Encoding utf8
           }
 
-          # 自定义通用 WinRT 异步等待函数（不依赖扩展方法）
+          # 稳健无错的通用 WinRT 异步等待函数（基于 TaskCompletionSource，零反射）
           function Await-WinRT ($asyncOp) {
-              $asTaskMethod = [System.WindowsRuntimeSystemExtensions].GetMethods() | 
-                  Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 } | 
-                  Select-Object -First 1
+              $tcs = New-Object System.Threading.Tasks.TaskCompletionSource[object]
               
-              if ($asyncOp.GetType().IsGenericType) {
-                  $genericMethod = $asTaskMethod.MakeGenericMethod($asyncOp.GetType().GetGenericArguments())
-                  $task = $genericMethod.Invoke($null, @($asyncOp))
-              } else {
-                  $task = $asTaskMethod.Invoke($null, @($asyncOp))
+              $asyncOp.Completed = [Windows.Foundation.AsyncOperationCompletedHandler[object]]{
+                  param($asyncInfo, $status)
+                  if ($status -eq [Windows.Foundation.AsyncStatus]::Completed) {
+                      try {
+                          $tcs.SetResult($asyncInfo.GetResults())
+                      } catch {
+                          $tcs.SetResult($null)
+                      }
+                  } else {
+                      $tcs.SetException((New-Object System.Exception("WinRT Async Operation failed with status: $status")))
+                  }
               }
-              $task.Wait()
-              if ($task.Exception) { throw $task.Exception }
-              if ($task.GetType().GetProperty('Result')) {
-                  return $task.Result
-              }
+              
+              $tcs.Task.Wait()
+              return $tcs.Task.Result
           }
 
           try {
@@ -54,7 +56,6 @@ jobs:
               Write-TestLog "Capturing screen directly into System.IO.MemoryStream..."
               Add-Type -AssemblyName System.Drawing
               Add-Type -AssemblyName System.Windows.Forms
-              Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
               $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
               $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
@@ -81,9 +82,9 @@ jobs:
               $writer = New-Object Windows.Storage.Streams.DataWriter($randomAccessStream)
               $writer.WriteBytes($bytes)
               
-              # 安全等待 StoreAsync 完成
-              $storeAsync = $writer.StoreAsync()
-              $null = Await-WinRT $storeAsync
+              # 安全原生异步等待
+              $storeTask = $writer.StoreAsync()
+              $null = Await-WinRT $storeTask
               
               $writer.DetachStream()
               $writer.Dispose()
