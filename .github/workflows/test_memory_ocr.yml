@@ -25,35 +25,14 @@ jobs:
               $logLine | Out-File -FilePath $logFile -Append -Encoding utf8
           }
 
-          # 稳健无错的通用 WinRT 异步等待函数（基于 TaskCompletionSource，零反射）
-          function Await-WinRT ($asyncOp) {
-              $tcs = New-Object System.Threading.Tasks.TaskCompletionSource[object]
-              
-              $asyncOp.Completed = [Windows.Foundation.AsyncOperationCompletedHandler[object]]{
-                  param($asyncInfo, $status)
-                  if ($status -eq [Windows.Foundation.AsyncStatus]::Completed) {
-                      try {
-                          $tcs.SetResult($asyncInfo.GetResults())
-                      } catch {
-                          $tcs.SetResult($null)
-                      }
-                  } else {
-                      $tcs.SetException((New-Object System.Exception("WinRT Async Operation failed with status: $status")))
-                  }
-              }
-              
-              $tcs.Task.Wait()
-              return $tcs.Task.Result
-          }
-
           try {
               Write-TestLog "Launching Microsoft Edge..."
               Start-Process "msedge.exe" -ArgumentList "https://account.microsoft.com/account", "--start-maximized"
-              
+
               Write-TestLog "Waiting 10 seconds for Edge to load..."
               Start-Sleep -Seconds 10
 
-              Write-TestLog "Capturing screen directly into System.IO.MemoryStream..."
+              Write-TestLog "Capturing screen directly into MemoryStream..."
               Add-Type -AssemblyName System.Drawing
               Add-Type -AssemblyName System.Windows.Forms
 
@@ -71,48 +50,56 @@ jobs:
 
               Write-TestLog "Screen captured into memory. Byte array length: $($bytes.Length) bytes."
 
-              Write-TestLog "Loading WinRT OCR assemblies..."
-              $null = [Windows.Globalization.Language, Windows.Globalization, ContentType=WindowsRuntime]
-              $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation.UniversalApiContract, ContentType=WindowsRuntime]
-              $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation.UniversalApiContract, ContentType=WindowsRuntime]
-              $null = [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Foundation.UniversalApiContract, ContentType=WindowsRuntime]
+              # 核心关键：编译一套 C# 极简桥接类，由 C# 原生 await 处理 WinRT 异步，PowerShell 零异步负担！
+              Write-TestLog "Compiling Native C# Memory OCR Bridge..."
+              $code = @"
+              using System;
+              using System.IO;
+              using System.Threading.Tasks;
+              using Windows.Globalization;
+              using Windows.Graphics.Imaging;
+              using Windows.Media.Ocr;
+              using Windows.Storage.Streams;
 
-              Write-TestLog "Converting byte array to WinRT InMemoryRandomAccessStream..."
-              $randomAccessStream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
-              $writer = New-Object Windows.Storage.Streams.DataWriter($randomAccessStream)
-              $writer.WriteBytes($bytes)
-              
-              # 安全原生异步等待
-              $storeTask = $writer.StoreAsync()
-              $null = Await-WinRT $storeTask
-              
-              $writer.DetachStream()
-              $writer.Dispose()
+              public class MemoryOcrBridge
+              {
+                  public static string DoOcrFromBytes(byte[] bytes)
+                  {
+                      return Task.Run(async () =>
+                      {
+                          using (var ms = new InMemoryRandomAccessStream())
+                          {
+                              using (var writer = new DataWriter(ms.GetOutputStreamAt(0)))
+                              {
+                                  writer.WriteBytes(bytes);
+                                  await writer.StoreAsync();
+                                  await writer.FlushAsync();
+                                  writer.DetachStream();
+                              }
+                              ms.Seek(0);
 
-              $randomAccessStream.Seek(0)
+                              var decoder = await BitmapDecoder.CreateAsync(ms);
+                              var softwareBitmap = await decoder.GetSoftwareBitmapAsync();
 
-              Write-TestLog "Initializing BitmapDecoder and OcrEngine..."
-              $decoderAsync = [Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($randomAccessStream)
-              $decoder = Await-WinRT $decoderAsync
+                              var engine = OcrEngine.TryCreateFromLanguage(new Language("en-US")) 
+                                        ?? OcrEngine.TryCreateFromUserProfileLanguages();
 
-              $softwareBitmapAsync = $decoder.GetSoftwareBitmapAsync()
-              $softwareBitmap = Await-WinRT $softwareBitmapAsync
-
-              $language = New-Object Windows.Globalization.Language("en-US")
-              $ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
-
-              if ($null -eq $ocrEngine) {
-                  $ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+                              var result = await engine.RecognizeAsync(softwareBitmap);
+                              return result.Text;
+                          }
+                      }).GetAwaiter().GetResult();
+                  }
               }
+"@
+              Add-Type -TypeDefinition $code -CompilerOptions "/target:library" -IgnoreWarnings
 
-              Write-TestLog "Executing OCR Engine recognizer..."
-              $ocrAsync = $ocrEngine.RecognizeAsync($softwareBitmap)
-              $ocrResult = Await-WinRT $ocrAsync
+              Write-TestLog "Executing C# WinRT Memory OCR Bridge..."
+              $ocrText = [MemoryOcrBridge]::DoOcrFromBytes($bytes)
 
               Write-TestLog "----------------- OCR RECOGNIZED TEXT -----------------"
-              if ($ocrResult.Text) {
+              if ($ocrText) {
                   Write-TestLog "SUCCESS: Recognized Text Content:"
-                  Write-TestLog $ocrResult.Text
+                  Write-TestLog $ocrText
               } else {
                   Write-TestLog "WARNING: OCR executed successfully, but no text was recognized on the screen."
               }
