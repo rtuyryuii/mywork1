@@ -28,11 +28,11 @@ jobs:
           try {
               Write-TestLog "Launching Microsoft Edge..."
               Start-Process "msedge.exe" -ArgumentList "https://account.microsoft.com/account", "--start-maximized"
-
+              
               Write-TestLog "Waiting 10 seconds for Edge to load..."
               Start-Sleep -Seconds 10
 
-              Write-TestLog "Capturing screen directly into MemoryStream..."
+              Write-TestLog "Capturing screen directly into System.IO.MemoryStream..."
               Add-Type -AssemblyName System.Drawing
               Add-Type -AssemblyName System.Windows.Forms
 
@@ -50,7 +50,6 @@ jobs:
 
               Write-TestLog "Screen captured into memory. Byte array length: $($bytes.Length) bytes."
 
-              # 核心关键：编译一套 C# 极简桥接类，由 C# 原生 await 处理 WinRT 异步，PowerShell 零异步负担！
               Write-TestLog "Compiling Native C# Memory OCR Bridge..."
               $code = @"
               using System;
